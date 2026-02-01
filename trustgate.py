@@ -1,93 +1,195 @@
-# =========================
-# TrustGate Benchmarking Framework
-# FD001 vs FD002 vs FD003 vs FD004
-# Multi-model, Colab-ready
-# =========================
+# =========================================================
+# TrustGate Network (Part 5)
+# =========================================================
+# - Learns adaptive modality trust
+# - Uses temporal reliability + operating context
+# - NumPy / Torch safe
+# =========================================================
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_absolute_error
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from sklearn.preprocessing import StandardScaler
-from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error
 
-# -------------------------
-# Data Loader
-# -------------------------
-def load_dataset(path):
-    cols = ['engine_id', 'cycle'] + \
-           [f'op_{i}' for i in range(1,4)] + \
-           [f's{i}' for i in range(1,22)]
-    return pd.read_csv(path, sep=' ', header=None).iloc[:, :-2].set_axis(cols, axis=1)
 
-datasets = {
-    'FD001': '/content/train_FD001.txt',
-    'FD002': '/content/train_FD002.txt',
-    'FD003': '/content/train_FD003.txt',
-    'FD004': '/content/train_FD004.txt'
-}
+# =========================================================
+# TEMPORAL RELIABILITY
+# =========================================================
+def compute_temporal_reliability(df, sensor_list, window=20):
+    """
+    Computes simple temporal reliability using rolling std.
+    Higher stability → higher reliability.
+    """
+    reliability = pd.DataFrame(index=df.index)
 
-# -------------------------
-# Add RUL Labels
-# -------------------------
-def add_rul(df):
-    max_cycle = df.groupby('engine_id')['cycle'].max()
-    df = df.merge(max_cycle, on='engine_id', suffixes=('', '_max'))
-    df['RUL'] = df['cycle_max'] - df['cycle']
-    return df.drop(columns=['cycle_max'])
+    for sensor in sensor_list:
+        roll_std = df.groupby('engine_id')[sensor].transform(
+            lambda x: x.rolling(window=window, min_periods=1).std().fillna(0)
+        )
 
-# -------------------------
-# TrustGate Evaluation
-# -------------------------
-def train_eval(df, model, model_name):
-    X = df.drop(columns=['engine_id', 'cycle', 'RUL'])
-    y = df['RUL']
-    X = StandardScaler().fit_transform(X)
+        std_min, std_max = roll_std.min(), roll_std.max()
+        if std_max - std_min > 1e-8:
+            rel = 1 - (roll_std - std_min) / (std_max - std_min)
+        else:
+            rel = pd.Series(1.0, index=roll_std.index)
 
-    model.fit(X, y)
-    preds = model.predict(X)
-    mae = mean_absolute_error(y, preds)
-    return model_name, mae
+        reliability[f"{sensor}_reliability"] = rel
 
-# -------------------------
-# Models to Compare
-# -------------------------
-models = [
-    ("Linear Regression", LinearRegression()),
-    ("Random Forest", RandomForestRegressor(
-        n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)),
-    ("XGBoost", XGBRegressor(
-        n_estimators=200, max_depth=6, learning_rate=0.1, random_state=42, n_jobs=-1))
-]
+    return reliability
 
-# -------------------------
-# Run TrustGate Benchmark
-# -------------------------
-results = []
 
-for name, path in datasets.items():
-    df = load_dataset(path)
-    df = add_rul(df)
-    for model_name, model in models:
-        mname, mae = train_eval(df, model, model_name)
-        results.append([name, mname, mae])
+# =========================================================
+# CONTEXT FEATURE PREPARATION
+# =========================================================
+def prepare_context_features(df, reliability_df):
+    """
+    Builds TrustGate context features:
+    - Operating settings
+    - Cycle position
+    - Average sensor reliability
+    - Operating-condition dummies
+    """
+    context = df[['op_setting_1', 'op_setting_2', 'cycle_norm']].copy()
 
-results_df = pd.DataFrame(results, columns=['Dataset', 'Model', 'MAE (cycles)'])
-print(results_df)
+    # Average reliability
+    rel_cols = [c for c in reliability_df.columns if 'reliability' in c]
+    context['avg_reliability'] = reliability_df[rel_cols].mean(axis=1)
 
-# -------------------------
-# Visualization
-# -------------------------
-plt.figure(figsize=(10,6))
-for model_name in results_df['Model'].unique():
-    subset = results_df[results_df['Model'] == model_name]
-    plt.plot(subset['Dataset'], subset['MAE (cycles)'], marker='o', label=model_name)
+    # Operating condition encoding
+    op_cond = (
+        df[['op_setting_1', 'op_setting_2']]
+        .round(1)
+        .astype(str)
+        .agg('_'.join, axis=1)
+    )
+    op_dummies = pd.get_dummies(op_cond, prefix='cond')
 
-plt.xlabel('C-MAPSS Subset')
-plt.ylabel('MAE (cycles)')
-plt.title('TrustGate Benchmark: RUL Prediction Difficulty (FD001–FD004)')
-plt.legend()
-plt.grid(True)
-plt.show()
+    context = pd.concat([context, op_dummies], axis=1)
+    return context
+
+
+# =========================================================
+# TRUSTGATE NETWORK
+# =========================================================
+class TrustGateNetwork(nn.Module):
+    def __init__(self, input_dim, n_modalities=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, n_modalities),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# =========================================================
+# TRAIN TRUSTGATE
+# =========================================================
+def train_trustgate(
+    train_df,
+    val_mask,
+    useful_sensors,
+    MODALITIES,
+    val_predictions,
+    y_val,
+    epochs=100,
+    lr=0.001
+):
+    """
+    Trains TrustGate Network on validation data.
+    Returns:
+    - trained TrustGate model
+    - scaler
+    - final fused predictions
+    - trust weights dataframe
+    """
+
+    # -----------------------------
+    # Validation subset
+    # -----------------------------
+    val_df = train_df[val_mask].copy()
+
+    # -----------------------------
+    # Reliability + Context
+    # -----------------------------
+    reliability = compute_temporal_reliability(val_df, useful_sensors)
+    context_df = prepare_context_features(val_df, reliability)
+
+    scaler = StandardScaler()
+    X_context = torch.FloatTensor(scaler.fit_transform(context_df))
+
+    y_true = torch.FloatTensor(y_val)
+
+    # -----------------------------
+    # Modality prediction tensors
+    # -----------------------------
+    modality_tensors = {
+        i: torch.FloatTensor(val_predictions[m])
+        for i, m in enumerate(MODALITIES)
+    }
+
+    # -----------------------------
+    # Model + Optimizer
+    # -----------------------------
+    tgn = TrustGateNetwork(X_context.shape[1], n_modalities=len(MODALITIES))
+    optimizer = optim.Adam(tgn.parameters(), lr=lr)
+    criterion = nn.L1Loss()
+
+    # -----------------------------
+    # Training loop
+    # -----------------------------
+    tgn.train()
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+
+        weights = tgn(X_context)
+        fused_pred = torch.zeros_like(y_true)
+
+        for i in range(len(MODALITIES)):
+            fused_pred += weights[:, i] * modality_tensors[i]
+
+        loss = criterion(fused_pred, y_true)
+        loss.backward()
+        optimizer.step()
+
+        if epoch % 20 == 0:
+            print(f"Epoch {epoch:3d} | Loss: {loss.item():.4f}")
+
+    # -----------------------------
+    # Final predictions
+    # -----------------------------
+    tgn.eval()
+    with torch.no_grad():
+        final_weights = tgn(X_context)
+        y_pred = torch.zeros_like(y_true)
+        for i in range(len(MODALITIES)):
+            y_pred += final_weights[:, i] * modality_tensors[i]
+
+    # -----------------------------
+    # Evaluation
+    # -----------------------------
+    mae = mean_absolute_error(y_val, y_pred.numpy())
+
+    weight_df = pd.DataFrame(
+        final_weights.numpy(),
+        columns=[f"{m}_weight" for m in MODALITIES],
+        index=val_df.index
+    )
+
+    return {
+        "model": tgn,
+        "scaler": scaler,
+        "mae": mae,
+        "y_pred": y_pred.numpy(),
+        "weights": weight_df,
+        "context": context_df
+    }
