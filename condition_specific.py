@@ -73,7 +73,7 @@ def run_condition_specific_evaluation(
             feats = [f for f in feats if f in cond_df.columns]
 
             if len(feats) == 0:
-                continue  # 🔴 critical safety fix
+                continue  # critical safety fix
 
             rf = RandomForestRegressor(
                 n_estimators=100,
@@ -161,3 +161,4 @@ def run_condition_specific_evaluation(
         "F1": f1_score(true <= 150, preds <= 150, zero_division=0),
         "Predictions": preds
     }
+
